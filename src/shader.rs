@@ -1,60 +1,25 @@
-use piston::vecmath::Matrix4;
+use gfx::traits::FactoryExt;
 use gfx;
-use gfx::{Device, DeviceHelper};
-use device;
+use vecmath::{self, Matrix4};
 
-static VERTEX: gfx::ShaderSource = shaders! {
-GLSL_120: b"
-    #version 120
-    uniform mat4 projection, view;
-
-    attribute vec2 tex_coord;
-    attribute vec3 color, position;
-
-    varying vec2 v_tex_coord;
-    varying vec3 v_color;
-
-    void main() {
-        v_tex_coord = tex_coord;
-        v_color = color;
-        gl_Position = projection * view * vec4(position, 1.0);
-    }
-"
-GLSL_150: b"
+static VERTEX: &'static [u8] = b"
     #version 150 core
-    uniform mat4 projection, view;
+    uniform mat4 u_projection, u_view;
 
-    in vec2 tex_coord;
-    in vec3 color, position;
+    in vec2 at_tex_coord;
+    in vec3 at_color, at_position;
 
     out vec2 v_tex_coord;
     out vec3 v_color;
 
     void main() {
-        v_tex_coord = tex_coord;
-        v_color = color;
-        gl_Position = projection * view * vec4(position, 1.0);
+        v_tex_coord = at_tex_coord;
+        v_color = at_color;
+        gl_Position = u_projection * u_view * vec4(at_position, 1.0);
     }
-"
-};
+";
 
-static FRAGMENT: gfx::ShaderSource = shaders!{
-GLSL_120: b"
-    #version 120
-
-    uniform sampler2D s_texture;
-
-    varying vec2 v_tex_coord;
-    varying vec3 v_color;
-
-    void main() {
-        vec4 tex_color = texture2D(s_texture, v_tex_coord);
-        if(tex_color.a == 0.0) // Discard transparent pixels.
-            discard;
-        gl_FragColor = tex_color * vec4(v_color, 1.0);
-    }
-"
-GLSL_150: b"
+static FRAGMENT: &'static [u8] = b"
     #version 150 core
     out vec4 out_color;
 
@@ -69,104 +34,111 @@ GLSL_150: b"
             discard;
         out_color = tex_color * vec4(v_color, 1.0);
     }
-"
-};
+";
 
-#[shader_param(Program)]
-pub struct ShaderParam {
-    pub projection: [[f32, ..4], ..4],
-    pub view: [[f32, ..4], ..4],
-    pub s_texture: gfx::shade::TextureParam,
+gfx_pipeline!( pipe {
+    vbuf: gfx::VertexBuffer<Vertex> = (),
+    transform: gfx::Global<[[f32; 4]; 4]> = "u_projection",
+    view: gfx::Global<[[f32; 4]; 4]> = "u_view",
+    color: gfx::TextureSampler<[f32; 4]> = "s_texture",
+    out_color: gfx::RenderTarget<gfx::format::Srgba8> = "out_color",
+    out_depth: gfx::DepthTarget<gfx::format::DepthStencil> =
+        gfx::preset::depth::LESS_EQUAL_WRITE,
+});
+
+gfx_vertex_struct!( Vertex {
+    xyz: [f32; 3] = "at_position",
+    uv: [f32; 2] = "at_tex_coord",
+    rgb: [f32; 3] = "at_color",
+});
+
+
+pub struct Renderer<R: gfx::Resources, F: gfx::Factory<R>, C: gfx::CommandBuffer<R>> {
+    factory: F,
+    pub pipe: gfx::PipelineState<R, pipe::Meta>,
+    data: pipe::Data<R>,
+    encoder: gfx::Encoder<R, C>,
+    clear_color: [f32; 4],
+    clear_depth: f32,
+    clear_stencil: u8,
+    slice: gfx::Slice<R>,
 }
 
-#[vertex_format]
-pub struct Vertex {
-    #[name="position"]
-    pub xyz: [f32, ..3],
-    #[name="tex_coord"]
-    pub uv: [f32, ..2],
-    #[name="color"]
-    pub rgb: [f32, ..3],
-}
+impl<R: gfx::Resources, F: gfx::Factory<R>, C: gfx::CommandBuffer<R>> Renderer<R, F, C> {
 
-impl Clone for Vertex {
-    fn clone(&self) -> Vertex {
-        *self
-    }
-}
+    pub fn new(mut factory: F, encoder: gfx::Encoder<R, C>, target: gfx::handle::RenderTargetView<R, gfx::format::Srgba8>,
+        depth: gfx::handle::DepthStencilView<R, (gfx::format::D24_S8, gfx::format::Unorm)>,
+        tex: gfx::handle::Texture<R, gfx::format::R8_G8_B8_A8>) -> Renderer<R, F, C> {
 
-pub struct Buffer {
-    buf: gfx::BufferHandle<Vertex>,
-    len: u32
-}
+        let sampler = factory.create_sampler(
+                gfx::texture::SamplerInfo::new(
+                    gfx::texture::FilterMethod::Scale,
+                    gfx::texture::WrapMode::Tile
+                )
+            );
 
-pub struct Renderer<D: gfx::Device> {
-    graphics: gfx::Graphics<D>,
-    params: ShaderParam,
-    frame: gfx::Frame,
-    cd: gfx::ClearData,
-    prog: device::Handle<u32, device::shade::ProgramInfo>,
-    drawstate: gfx::DrawState
-}
+        let texture_view = factory.view_texture_as_shader_resource::<gfx::format::Rgba8>(
+            &tex, (0, 0), gfx::format::Swizzle::new()).unwrap();
 
-impl<D: gfx::Device> Renderer<D> {
-    pub fn new(mut device: D, frame: gfx::Frame, tex: gfx::TextureHandle) -> Renderer<D> {
-        let sam = device.create_sampler(gfx::tex::SamplerInfo::new(gfx::tex::Scale, gfx::tex::Tile));
-        let mut graphics = gfx::Graphics::new(device);
+        let prog = factory.link_program(VERTEX, FRAGMENT).unwrap();
 
-        let params = ShaderParam {
-            projection: [[0.0, ..4], ..4],
-            view: [[0.0, ..4], ..4],
-            s_texture: (tex, Some(sam))
+        let mut rasterizer = gfx::state::Rasterizer::new_fill();
+        rasterizer.front_face = gfx::state::FrontFace::Clockwise;
+        let pipe = factory.create_pipeline_from_program(&prog, gfx::Primitive::TriangleList,
+            rasterizer, pipe::new()).unwrap();
+
+        let vbuf = factory.create_vertex_buffer(&[]);
+        let slice = gfx::Slice::new_match_vertex_buffer(&vbuf);
+
+        let data = pipe::Data {
+            vbuf: vbuf,
+            transform: vecmath::mat4_id(),
+            view: vecmath::mat4_id(),
+            color: (texture_view, sampler),
+            out_color: target,
+            out_depth: depth,
         };
-        let prog = graphics.device.link_program(VERTEX.clone(), FRAGMENT.clone()).unwrap();
-        let mut drawstate = gfx::DrawState::new().depth(gfx::state::LessEqual, true);
-        drawstate.primitive.front_face = gfx::state::Clockwise;
 
         Renderer {
-            graphics: graphics,
-            params: params,
-            frame: frame,
-            cd: gfx::ClearData {
-                color: Some([0.81, 0.8, 1.0, 1.0]),
-                depth: Some(1.0),
-                stencil: None,
-            },
-            prog: prog,
-            drawstate: drawstate,
+            factory: factory,
+            pipe: pipe,
+            data: data,
+            encoder: encoder,
+            clear_color: [0.81, 0.8, 1.0, 1.0],
+            clear_depth: 1.0,
+            clear_stencil: 0,
+            slice: slice,
         }
     }
 
     pub fn set_projection(&mut self, proj_mat: Matrix4<f32>) {
-        self.params.projection = proj_mat;
+        self.data.transform = proj_mat;
     }
 
     pub fn set_view(&mut self, view_mat: Matrix4<f32>) {
-        self.params.view = view_mat;
+        self.data.view = view_mat;
     }
 
     pub fn clear(&mut self) {
-        self.graphics.clear(self.cd, &self.frame);
+        self.encoder.clear(&self.data.out_color, self.clear_color);
+        self.encoder.clear_depth(&self.data.out_depth, self.clear_depth);
+        self.encoder.clear_stencil(&self.data.out_depth, self.clear_stencil);
     }
 
-    pub fn create_buffer(&mut self, data: &[Vertex]) -> Buffer {
-        let buf = self.graphics.device.create_buffer(data.len(), gfx::UsageStatic);
-        self.graphics.device.update_buffer(buf, &data, 0);
-        Buffer { buf: buf, len: data.len() as u32 }
+    pub fn flush<D: gfx::Device<Resources=R, CommandBuffer=C> + Sized>(&mut self, device: &mut D) {
+        self.encoder.flush(device);
     }
 
-    pub fn delete_buffer(&mut self, buf: Buffer) {
-        self.graphics.device.delete_buffer(buf.buf);
+    pub fn create_buffer(&mut self, data: &[Vertex]) -> gfx::handle::Buffer<R, Vertex> {
+        let vbuf = self.factory.create_vertex_buffer(data);
+        self.slice = gfx::Slice::new_match_vertex_buffer(&vbuf);
+
+        vbuf
     }
 
-    pub fn render(&mut self, buffer: Buffer) {
-        let mesh = gfx::Mesh::from_format(buffer.buf, buffer.len);
-        let batch = self.graphics.make_batch(&mesh, mesh.get_slice(gfx::TriangleList),
-                                             &self.prog, &self.drawstate).unwrap();
-        self.graphics.draw(&batch, &self.params, &self.frame);
-    }
-
-    pub fn end_frame(&mut self) {
-        self.graphics.end_frame();
+    pub fn render(&mut self, buffer: &mut gfx::handle::Buffer<R, Vertex>) {
+        self.data.vbuf = buffer.clone();
+        self.slice.end = buffer.len() as u32;
+        self.encoder.draw(&self.slice, &self.pipe, &self.data);
     }
 }
